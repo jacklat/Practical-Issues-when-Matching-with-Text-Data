@@ -1,0 +1,484 @@
+---
+title: "Data Cleaning"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+## Data Cleaning 
+
+The first step is to load in and clean our data. In order to do this we begin by disaggregating the zipped file into separate json files for us to load in and analyze. In our analysis, we care about 3 of the 6 datasets: business, users, and reviews. 
+
+```{r, eval=FALSE}
+library(utils)
+untar("yelp_dataset.tar")
+```
+
+## User Dataset 
+
+We begin by loading in the dataset for users. 
+
+```{r}
+library(jsonlite)
+users <- stream_in(file("user.json"),pagesize = 10000)
+```
+
+We then preview this dataframe:
+
+```{r}
+head(users)
+```
+
+
+This is too many covariates and so we begin by dropping entirely irrelevant ones: their name and their friends (friends could theoretically be interesting from a network perspective but is too complicated for the sake of this project). 
+
+```{r}
+users <- users[,-2]
+users <- users[,-8]
+```
+
+Their user ID and review count are both potentially useful variables (user ID to combine with review and business datasets). For the date when they began yelping, it's currently too fine tuned. Thus, we transform that variable into the year they started yelping rather than a specific date and time. 
+
+
+```{r}
+users$yelping_since <- as.numeric(substring(users$yelping_since,1,4))
+```
+Useful, funny, and cool votes we keep for now although it's possible we'll want to aggregate those later. For elite status, we convert it into a binary variable of whether the person has ever held elite status (yes is 1 and no is 0). 
+
+```{r}
+users$elite <- ifelse(users$elite == "",0,1)
+```
+
+Fans and average number of stars we both want to keep. However, there are too many compliment variables. Thus, we just sum over all of the different types of compliments and then drop the original columns. 
+
+```{r}
+users$total_compliment <- users$compliment_hot + users$compliment_more + users$compliment_profile + users$compliment_cute + users$compliment_list + users$compliment_note + users$compliment_plain + users$compliment_cool + users$compliment_funny + users$compliment_writer + users$compliment_photos
+users <- users[,!names(users) %in% c("compliment_hot","compliment_more","compliment_profile","compliment_cute","compliment_list", "compliment_note", "compliment_plain","compliment_cool","compliment_funny", "compliment_writer", "compliment_photos")]
+
+```
+
+
+We now save this dataset: 
+
+```{r}
+save.image(file="cleaned_datasets.RData")
+```
+
+## Business Dataset 
+
+Next, we go through and do cleaning for the business level dataset: 
+
+```{r}
+business <- stream_in(file("business.json"),pagesize = 10000)
+head(business)
+```
+
+We first get rid of the irrelevant variables which are too fine-grained. This includes the business name, business address, city, postal code, latitude, longitude, attributes, categories, and hours. 
+
+
+```{r}
+business <- business[,!names(business) %in% c("name","address","city","postal_code","latitude", "longitude", "attributes","categories","hours")]
+```
+
+Next, we want to remove businesses outside of states that have fewer than 1000 reviewed businesses (as if we want to use that as a matching variable, it doesn't make sense to match on states that have a very small number of businesses in this dataset). Thus, we keep 11 locations: Alberta (code AB--8012 businesses), Arizona (code AZ--56686 businesses), Illinois (code IL--1932 businesses), North Carolina (code NC--14720 businesses), Nevada (code NV--36312 businesses), Ohio (code OH--14697 businesses), Ontario (code ON--33412 businesses), Pennsylvania (code PA--11216 businesses), Quebec (code QC--9219 businesses), South Carolina (code SC--1162 businesses), and Wisconsin (code WI--5154 businesses). 
+
+```{r}
+table(business$state)
+business <- business[business$state %in% c("AB","AZ","IL","NC","NV","OH","ON","PA","QC","SC","WI"),]
+```
+
+Now rather than listing a state, we want to turn this single state variable into 11 state dummy variables (one for each location): 
+
+```{r}
+business<- fastDummies::dummy_cols(business,select_columns="state")
+head(business)
+```
+
+Now, we save these datasets once more: 
+
+
+```{r}
+save.image(file="cleaned_datasets.RData")
+```
+
+
+## Reviews
+
+Finally, we read in the reviews: 
+
+
+```{r}
+reviews <- stream_in(file("review.json"),pagesize = 10000)
+```
+We then look at the reviews: 
+
+```{r}
+head(reviews)
+```
+
+First, we want to get rid of any 3 star reviews as they're not relevant. We then keep the number of stars but also create a new dummy variable as a treatment indicator (where a 1 indicates a treatment--i.e. a 4 or 5 star review and a 0 indicates a control (i.e. a 1 or 2 star review)):
+
+```{r}
+reviews <- reviews[!(reviews$stars==3),]
+```
+
+```{r}
+reviews$treatment  <- ifelse(reviews$stars==5|reviews$stars==4,1,0)
+```
+
+As we did with the user dataset, we just pull off the year of the review rather than having a full date/time: 
+
+```{r}
+reviews$date <- as.numeric(substring(reviews$date,1,4))
+```
+
+Next, we get the length of the review (the number of words) as a new column as that could potentially be predictive of its usefulness/a helpful variable to match on: 
+
+```{r}
+library(stringr)
+reviews$length <-  str_count(reviews$text, '\\w+')
+```
+
+We then want to get rid of any reviews associated with businesses that we deleted above due to them being in states with few businesses: 
+
+```{r}
+reviews <- reviews[reviews$business_id %in% business$business_id, ]
+```
+
+We save the data once more: 
+
+```{r}
+save.image(file="cleaned_datasets.RData")
+```
+## Term Document Matrix
+
+We now want to edit the reviews themselves by getting rid of extremely high and low frequency words and converting them into a term document frequency matrix. We run into memory issues in extracting the vector of words here so we first just pull out the text vector that we need and then delete all of our other dataframes (as we have saved them above). Hopefully, our sparse document term matrix is sufficiently low memory that we then have enough memory to load back in these other dataframes: 
+
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(stringr)
+library(textstem)
+library(tm)
+library(tidyverse)
+library(Matching)
+
+set.seed(491)
+rm(list=ls())
+load("cleaned_datasets.RData")
+reviews_sample <- reviews %>% group_by(treatment) %>% sample_n(50000)
+reviews_sample <- as.data.frame(reviews_sample)
+reviews_sample_text <- reviews_sample$text
+rm(reviews,business,users)
+save.image("Reviews_Sample.RData")
+
+reviews_sample_text <- as.data.frame(reviews_sample_text)
+names(reviews_sample_text)[1] <- "text"
+reviews_sample_text$text <- as.character(reviews_sample_text$text)
+reviews_sample_text$ID <- seq(1,length(reviews_sample_text$text))
+words_sample <- reviews_sample_text %>% unnest_tokens(input = text, output = word) %>% anti_join(stop_words) 
+save(words_sample, file="words_sample.RData")
+
+words_sample[,2] <- lemmatize_words(words_sample[,2])
+words_count_sample <- words_sample %>%  count(word, sort = TRUE)
+words_count_sample <- words_count_sample[words_count_sample[,2]>=10,]
+words_count_sample <- words_count_sample[words_count_sample[,2]<=1000,]
+words_count_sample_df <- as.data.frame(words_count_sample)
+words_sample_final <- words_sample[words_sample[,2] %in% words_count_sample_df[,1],]
+save(words_count_sample,words_count_sample_df,words_sample_final, file="words_compiled_filtered_and_counts_sample.RData")
+
+dtm_absolute_sample <- words_sample_final %>%
+    count(ID, word) %>%
+    cast_sparse(ID, word, n)
+
+save(dtm_absolute_sample,file="dtm_absolute_sample.RData")
+
+
+```
+
+
+
+
+
+
+
+
+
+## Initial Matching
+
+```{r}
+load("Reviews_sample.RData")
+```
+
+```{r}
+reviews_sample$funny_cat <- cut(reviews_sample$funny, breaks=c(0,0.9,1.9,c(2.9,10.1),max(reviews_sample$funny)), include.lowest=TRUE,labels=c(1:5))
+reviews_sample$cool_cat <- cut(reviews_sample$cool, breaks=c(0,0.9,1.9,c(2.9,10.1),max(reviews_sample$cool)), include.lowest=TRUE,labels=c(1:5))
+reviews_sample$length_cat <- cut(reviews_sample$length, breaks=c(0,100,200,300,400,max(reviews_sample$length)), include.lowest=TRUE,labels=c(1:5))
+
+```
+
+
+```{r}
+glm1 <- glm(treatment ~ funny + length + cool + date, family=binomial, data=reviews_sample)
+glm2 <- glm(treatment ~ factor(funny_cat) + factor(length_cat) + factor(cool_cat) + date, family=binomial, data=reviews_sample)
+glm3 <- glm(treatment ~ funny + length + cool + date + I(funny^2) + I(length^2) + I(cool^2) , family=binomial, data=reviews_sample)
+summary(glm1)
+summary(glm2)
+summary(glm3)
+```
+
+```{r}
+library(pscl)
+pR2(glm1)
+pR2(glm2)
+pR2(glm3)
+```
+
+
+
+```{r}
+library(Matching)
+
+att1 <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm1$fitted, ties=FALSE) 
+att2 <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm2$fitted, ties=FALSE) 
+att3 <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm3$fitted, ties=FALSE) 
+save(att1,att2,att3,file="Balance_Evaluation.RData")
+```
+
+
+
+```{r}
+library(Matching)
+
+
+att <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm1$fitted, ties=FALSE) 
+atc <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm1$fitted, ties=FALSE,estimand="ATC") 
+ate <- Match(Y = reviews_sample$useful, Tr = reviews_sample$treatment, X=glm1$fitted, ties=FALSE ,estimand="ATE") 
+summary(att)
+summary(atc)
+summary(ate)
+save(att,atc,ate,file="Initial_Matches_Sample.RData")
+```
+
+
+```{r}
+mb1  <- MatchBalance(treatment~funny + length + cool + date, data=reviews_sample, match.out=att1, nboots=500)
+mb2 <- MatchBalance(treatment ~ factor(funny_cat) + factor(length_cat) + factor(cool_cat) + date,data=reviews_sample, match.out=att2, nboots=500)
+mb3 <- MatchBalance(treatment ~ funny + length + cool + date + I(funny^2) + I(length^2) + I(cool^2),data=reviews_sample,match.out=att3,nboots=500)
+save(mb1,mb2,mb3,file="Match_Balances.RData")
+```
+
+
+
+```{r}
+load("Initial_Matches_Sample.RData")
+```
+
+
+```{r}
+summary(att)
+summary(atc)
+summary(ate)
+```
+
+
+
+
+## Text Caliper Matching
+
+```{r}
+len <- 50000
+potential_match <- vector(mode = "list", length = len)
+for(i in 1:len){
+upper <- glm1$fitted.values[i] + 0.1*sd(glm1$fitted.values)
+lower <- glm1$fitted.values[i] - 0.1*sd(glm1$fitted.values)
+original <- which(glm1$fitted.values <=upper & glm1$fitted.value >= lower)
+match <- original[original>len]
+potential_match[[i]] <- match
+if(i %% 1000 ==0){print(i)}
+}
+```
+```{r}
+library(lsa)
+library(qlcMatrix)
+set.seed(1)
+sample.vec <- function(x, ...) x[sample(length(x), ...)]
+control_matches <- seq(1,len)
+treatment_matches <- rep(NA,len)
+for(i in 1:len){
+res <- try(dtm_absolute_sample[as.character(i),],silent=TRUE)
+if(class(res) != "try-error"){
+   subsample <- potential_match[[i]][potential_match[[i]] %in% as.numeric(row.names(dtm_absolute_sample))]
+  cosines <- cosSparse(cbind(dtm_absolute_sample[as.character(i),],t(dtm_absolute_sample[as.character(subsample),])))
+  treatment_matches[i] <- sample.vec(as.numeric(rownames(cosines)[which(cosines[1,]==sort(cosines[1,],decreasing=TRUE)[2])]),1)
+  if(i %% 250 ==0){print(i)}
+}
+}
+```
+
+
+```{r}
+#save(potential_match,file="Matches_To_Control.RData")
+#rm(potential_match)
+len <- 50000
+potential_match2 <- vector(mode = "list", length = len)
+for(i in (len+1):(2*len)){
+upper <- glm1$fitted.values[i] + 0.1*sd(glm1$fitted.values)
+lower <- glm1$fitted.values[i] - 0.1*sd(glm1$fitted.values)
+original <- which(glm1$fitted.values <=upper & glm1$fitted.value >= lower)
+match <- original[original<=len]
+potential_match2[[(i-len)]] <- match
+if(i %% 1000 ==0){print(i)}
+}
+library(lsa)
+library(qlcMatrix)
+set.seed(1)
+sample.vec <- function(x, ...) x[sample(length(x), ...)]
+control_matches2 <- rep(NA,len)
+treatment_matches2 <- seq((len+1),2*len)
+for(i in (len+1):(2*len)){
+res <- try(dtm_absolute_sample[as.character(i),],silent=TRUE)
+if(class(res) != "try-error"){
+   subsample <- potential_match2[[()]][potential_match2[[i]] %in% as.numeric(row.names(dtm_absolute_sample))]
+  cosines <- cosSparse(cbind(dtm_absolute_sample[as.character(i),],t(dtm_absolute_sample[as.character(subsample),])))
+  treatment_matches2[(i-len)] <- sample.vec(as.numeric(rownames(cosines)[which(cosines[1,]==sort(cosines[1,],decreasing=TRUE)[2])]),1)
+  if(i %% 250 ==0){print(i)}
+}
+}
+```
+
+
+```{r}
+library(lsa)
+library(qlcMatrix)
+set.seed(1)
+sample.vec <- function(x, ...) x[sample(length(x), ...)]
+control_matches2 <- rep(NA,len)
+treatment_matches2 <- seq((len+1),2*len)
+for(i in (len+1):(2*len)){
+res <- try(dtm_absolute_sample[as.character(i),],silent=TRUE)
+if(class(res) != "try-error"){
+   subsample <- potential_match2[[(i-len)]][potential_match2[[(i-len)]] %in% as.numeric(row.names(dtm_absolute_sample))]
+  cosines <- cosSparse(cbind(dtm_absolute_sample[as.character(i),],t(dtm_absolute_sample[as.character(subsample),])))
+  control_matches2[(i-len)] <- sample.vec(as.numeric(rownames(cosines)[which(cosines[1,]==sort(cosines[1,],decreasing=TRUE)[2])]),1)
+  if(i %% 250 ==0){
+    print(i)
+    print(control_matches2[(i-len)])}
+}
+}
+```
+
+
+
+
+
+```{r}
+row.names(dtm_absolute_sample)
+```
+
+
+
+## Plots 
+```{r}
+hist(reviews_sample$date[reviews_sample$treatment==1])
+hist(reviews_sample$date[reviews_sample$treatment==0])
+library(ggplot2)
+require(gridExtra)
+a <- ggplot(reviews_sample[reviews_sample$treatment==1,],aes(x=date)) + geom_histogram(color="grey",fill="navy",binwidth=1) + ggtitle("Year in Treatment") +
+  xlab("Year") + ylab("Frequency") + theme(plot.title = element_text(size=16))
+b <-  ggplot(reviews_sample[reviews_sample$treatment==1,],aes(x=date)) + geom_histogram(color="grey",fill="navy",binwidth=1) + ggtitle("Year in Control") +
+  xlab("Year") + ylab("Frequency") + theme(plot.title = element_text(size=16))
+grid.arrange(a,b,ncol=2)
+c <- ggplot(reviews_sample[reviews_sample$treatment==1,],aes(x=length)) + geom_histogram(color="grey",fill="navy",binwidth=10) + ggtitle("Length in Treatment") +
+  xlab("Length") + ylab("Frequency") + theme(plot.title = element_text(size=16))
+d <-  ggplot(reviews_sample[reviews_sample$treatment==1,],aes(x=length)) + geom_histogram(color="grey",fill="navy",binwidth=10) + ggtitle("Length in Control") +
+  xlab("Length") + ylab("Frequency") + theme(plot.title = element_text(size=16))
+grid.arrange(c,d,ncol=2)
+```
+## Summary Stats
+
+```{r}
+summary(reviews_sample$length[reviews_sample$treatment==1])
+summary(reviews_sample$length[reviews_sample$treatment==0])
+t.test(reviews_sample$length[reviews_sample$treatment==1],reviews_sample$length[reviews_sample$treatment==0])
+```
+
+
+```{r}
+summary(reviews_sample$useful[reviews_sample$treatment==1])
+summary(reviews_sample$useful[reviews_sample$treatment==0])
+summary(reviews_sample$funny[reviews_sample$treatment==1])
+summary(reviews_sample$funny[reviews_sample$treatment==0])
+summary(reviews_sample$cool[reviews_sample$treatment==1])
+summary(reviews_sample$cool[reviews_sample$treatment==0])
+```
+
+
+
+```{r}
+var(reviews_sample$useful[reviews_sample$treatment==1])
+var(reviews_sample$useful[reviews_sample$treatment==0])
+var(reviews_sample$funny[reviews_sample$treatment==1])
+var(reviews_sample$funny[reviews_sample$treatment==0])
+var(reviews_sample$cool[reviews_sample$treatment==1])
+var(reviews_sample$cool[reviews_sample$treatment==0])
+t.test(reviews_sample$useful[reviews_sample$treatment==1],reviews_sample$useful[reviews_sample$treatment==0],var.equal=TRUE)
+t.test(reviews_sample$funny[reviews_sample$treatment==1], reviews_sample$funny[reviews_sample$treatment==0],var.equal=TRUE)
+t.test(reviews_sample$cool[reviews_sample$treatment==1],reviews_sample$cool[reviews_sample$treatment==0],var.equal=FALSE)
+```
+
+
+```{r}
+100*length(reviews_sample$length[reviews_sample$treatment==0 & reviews_sample$length<=100])/length(reviews_sample$length[reviews_sample$treatment==0])
+
+100*length(reviews_sample$length[reviews_sample$treatment==0 & reviews_sample$length>=101 & reviews_sample$length<=200])/length(reviews_sample$length[reviews_sample$treatment==0])
+
+100*length(reviews_sample$length[reviews_sample$treatment==0 & reviews_sample$length>=201 & reviews_sample$length<=300])/length(reviews_sample$length[reviews_sample$treatment==0])
+
+100*length(reviews_sample$length[reviews_sample$treatment==0 & reviews_sample$length>=301 & reviews_sample$length<=400])/length(reviews_sample$length[reviews_sample$treatment==0])
+
+100*length(reviews_sample$length[reviews_sample$treatment==0 & reviews_sample$length>=401])/length(reviews_sample$length[reviews_sample$treatment==0])
+
+
+100*length(reviews_sample$length[reviews_sample$treatment==1 & reviews_sample$length<=100])/length(reviews_sample$length[reviews_sample$treatment==1])
+
+100*length(reviews_sample$length[reviews_sample$treatment==1 & reviews_sample$length>=101 & reviews_sample$length<=200])/length(reviews_sample$length[reviews_sample$treatment==1])
+
+100*length(reviews_sample$length[reviews_sample$treatment==1 & reviews_sample$length>=201 & reviews_sample$length<=300])/length(reviews_sample$length[reviews_sample$treatment==1])
+
+100*length(reviews_sample$length[reviews_sample$treatment==1 & reviews_sample$length>=301 & reviews_sample$length<=400])/length(reviews_sample$length[reviews_sample$treatment==1])
+
+100*length(reviews_sample$length[reviews_sample$treatment==1 & reviews_sample$length>=401])/length(reviews_sample$length[reviews_sample$treatment==1])
+```
+
+
+## Appendix
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(stringr)
+library(textstem)
+library(tm)
+library(tidyverse)
+library(Matching)
+words_count_sample_appendix <- words_sample %>%  count(word, sort = TRUE)
+words_count_sample_appendix_df <- as.data.frame(words_count_sample_appendix)
+```
+```{r}
+head(words_count_sample_appendix_df,n=100)
+tail(words_count_sample_appendix_df,n=100)
+```
+
+
+```{r}
+words_count_sample_appendix[words_count_sample_appendix$n==1,]
+```
+
